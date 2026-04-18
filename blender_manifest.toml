@@ -1,0 +1,10 @@
+schema_version = "1.0.0"
+id = "comfy_connector"
+version = "0.1.0"
+name = "ComfyConnector"
+tagline = "Connect Blender to ComfyUI"
+maintainer = "Brian Ritzinger"
+type = "add-on"
+blender_version_min = "5.1.0"
+license = ["SPDX:GPL-2.0-or-later"]
+category = "Render"
