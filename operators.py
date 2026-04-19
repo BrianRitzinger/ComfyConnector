@@ -103,9 +103,9 @@ class COMFY_OT_cancel_workflow(bpy.types.Operator):
 
 
 class COMFY_OT_set_background(bpy.types.Operator):
-    """Set the selected image as the 3D viewport background"""
+    """Set the selected image as the active camera background"""
     bl_idname = "comfy.set_background"
-    bl_label = "Set as Background"
+    bl_label = "Set as Cam Background"
 
     def execute(self, context):
         scene = context.scene
@@ -113,18 +113,18 @@ class COMFY_OT_set_background(bpy.types.Operator):
             self.report({"ERROR"}, "No images available")
             return {"CANCELLED"}
 
+        camera = scene.camera
+        if not camera or camera.type != "CAMERA":
+            self.report({"ERROR"}, "No active camera in scene")
+            return {"CANCELLED"}
+
         item = scene.comfy_images[scene.comfy_active_image]
         image = bpy.data.images.load(item.filepath, check_existing=True)
 
-        space = context.space_data
-        if not hasattr(space, "background_images"):
-            self.report({"ERROR"}, "Open a 3D viewport first")
-            return {"CANCELLED"}
-
-        space.show_background_images = True
-        bg = space.background_images.new()
+        camera.data.show_background_images = True
+        bg = camera.data.background_images.new()
         bg.image = image
-        self.report({"INFO"}, f"Set background: {item.name}")
+        self.report({"INFO"}, f"Set camera background: {item.name}")
         return {"FINISHED"}
 
 

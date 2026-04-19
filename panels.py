@@ -58,6 +58,12 @@ class COMFY_PT_main_panel(bpy.types.Panel):
                 scene, "comfy_active_image",
                 rows=3,
             )
+            layout.prop(scene, "comfy_icon_scale", text="Preview Size")
+            active = scene.comfy_images[scene.comfy_active_image] if scene.comfy_images else None
+            if active:
+                icon_id = previews.load_preview(active.filepath)
+                if icon_id:
+                    layout.template_icon(icon_value=icon_id, scale=scene.comfy_icon_scale)
             row = layout.row(align=True)
             row.operator("comfy.set_background", icon="IMAGE_BACKGROUND")
             row.operator("comfy.apply_texture", icon="MATERIAL")

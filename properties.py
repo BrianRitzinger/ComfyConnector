@@ -38,6 +38,12 @@ def register():
     bpy.types.Scene.comfy_inputs = CollectionProperty(type=ComfyInput)
     bpy.types.Scene.comfy_images = CollectionProperty(type=ComfyImage)
     bpy.types.Scene.comfy_active_image = IntProperty(name="Active Image", default=0)
+    bpy.types.Scene.comfy_icon_scale = IntProperty(
+        name="Preview Size",
+        default=8,
+        min=2,
+        max=20,
+    )
 
 
 def unregister():
@@ -49,3 +55,4 @@ def unregister():
     del bpy.types.Scene.comfy_inputs
     del bpy.types.Scene.comfy_images
     del bpy.types.Scene.comfy_active_image
+    del bpy.types.Scene.comfy_icon_scale
