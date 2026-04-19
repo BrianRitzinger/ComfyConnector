@@ -38,6 +38,29 @@ def scan_workflow_inputs(workflow: dict) -> list[dict]:
     return inputs
 
 
+def build_prompt(workflow_path: str, inputs: list) -> dict:
+    """Load workflow JSON and patch in current [CC] input values."""
+    with open(workflow_path, "r") as f:
+        workflow = json.load(f)
+
+    for item in inputs:
+        node = workflow.get(item.node_id)
+        if not node:
+            continue
+        original = node["inputs"].get(item.input_key)
+        # preserve the original type — bool must be checked before int (bool is a subclass of int)
+        if isinstance(original, bool):
+            node["inputs"][item.input_key] = item.value.lower() == "true"
+        elif isinstance(original, int):
+            node["inputs"][item.input_key] = int(item.value)
+        elif isinstance(original, float):
+            node["inputs"][item.input_key] = float(item.value)
+        else:
+            node["inputs"][item.input_key] = item.value
+
+    return workflow
+
+
 class COMFY_OT_check_connection(bpy.types.Operator):
     """Check if ComfyUI is running"""
     bl_idname = "comfy.check_connection"
@@ -92,6 +115,45 @@ class COMFY_OT_load_workflow(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class COMFY_OT_run_workflow(bpy.types.Operator):
+    """Submit the workflow to ComfyUI"""
+    bl_idname = "comfy.run_workflow"
+    bl_label = "Run Workflow"
+
+    def execute(self, context):
+        scene = context.scene
+
+        if not scene.comfy_workflow_path:
+            self.report({"ERROR"}, "No workflow loaded")
+            return {"CANCELLED"}
+
+        try:
+            workflow = build_prompt(scene.comfy_workflow_path, scene.comfy_inputs)
+        except Exception as e:
+            self.report({"ERROR"}, f"Could not build workflow: {e}")
+            return {"CANCELLED"}
+
+        payload = json.dumps({"prompt": workflow}).encode("utf-8")
+        url = f"{scene.comfy_server_url}/prompt"
+
+        try:
+            req = urllib.request.Request(
+                url,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as response:
+                result = json.loads(response.read())
+            prompt_id = result.get("prompt_id", "unknown")
+            self.report({"INFO"}, f"Workflow queued — prompt_id: {prompt_id}")
+        except urllib.error.URLError as e:
+            self.report({"ERROR"}, f"Failed to submit workflow: {e}")
+            return {"CANCELLED"}
+
+        return {"FINISHED"}
+
+
 class COMFY_PT_main_panel(bpy.types.Panel):
     """Main ComfyConnector panel in the 3D viewport sidebar"""
     bl_label = "ComfyUI"
@@ -119,11 +181,15 @@ class COMFY_PT_main_panel(bpy.types.Panel):
             for item in context.scene.comfy_inputs:
                 layout.prop(item, "value", text=item.label)
 
+            layout.separator()
+            layout.operator("comfy.run_workflow", icon="PLAY")
+
 
 classes = [
     ComfyInput,
     COMFY_OT_check_connection,
     COMFY_OT_load_workflow,
+    COMFY_OT_run_workflow,
     COMFY_PT_main_panel,
 ]
 
