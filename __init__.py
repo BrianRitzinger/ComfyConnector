@@ -2,9 +2,40 @@ import bpy
 import urllib.request
 import urllib.error
 import json
-from bpy.props import StringProperty
+from bpy.props import StringProperty, CollectionProperty
+from bpy.types import PropertyGroup
 
 COMFY_URL_DEFAULT = "http://localhost:8188"
+CC_PREFIX = "[CC]"
+
+
+class ComfyInput(PropertyGroup):
+    """Stores one [CC] tagged input from the workflow"""
+    node_id: StringProperty()
+    input_key: StringProperty()
+    label: StringProperty()
+    value: StringProperty()
+
+
+def scan_workflow_inputs(workflow: dict) -> list[dict]:
+    """Return list of {node_id, input_key, label} for all [CC] tagged nodes."""
+    inputs = []
+    for node_id, node in workflow.items():
+        title = node.get("_meta", {}).get("title", "")
+        if CC_PREFIX not in title:
+            continue
+        label = title.replace(CC_PREFIX, "").strip()
+        node_inputs = node.get("inputs", {})
+        for key, value in node_inputs.items():
+            if isinstance(value, list):
+                continue  # skip node links, only expose plain values
+            inputs.append({
+                "node_id": node_id,
+                "input_key": key,
+                "label": f"{label} — {key}",
+                "value": str(value),
+            })
+    return inputs
 
 
 class COMFY_OT_check_connection(bpy.types.Operator):
@@ -36,8 +67,28 @@ class COMFY_OT_load_workflow(bpy.types.Operator):
         return {"RUNNING_MODAL"}
 
     def execute(self, context):
+        try:
+            with open(self.filepath, "r") as f:
+                workflow = json.load(f)
+        except Exception as e:
+            self.report({"ERROR"}, f"Could not read workflow: {e}")
+            return {"CANCELLED"}
+
         context.scene.comfy_workflow_path = self.filepath
-        self.report({"INFO"}, f"Loaded: {self.filepath}")
+        context.scene.comfy_inputs.clear()
+
+        found = scan_workflow_inputs(workflow)
+        for item in found:
+            entry = context.scene.comfy_inputs.add()
+            entry.node_id = item["node_id"]
+            entry.input_key = item["input_key"]
+            entry.label = item["label"]
+            entry.value = item["value"]
+
+        if found:
+            self.report({"INFO"}, f"Loaded {len(found)} [CC] input(s) from workflow")
+        else:
+            self.report({"WARNING"}, "No [CC] tagged nodes found in workflow")
         return {"FINISHED"}
 
 
@@ -62,8 +113,15 @@ class COMFY_PT_main_panel(bpy.types.Panel):
         layout.operator("comfy.load_workflow", icon="FILEBROWSER",
                         text=context.scene.comfy_workflow_path or "Select workflow JSON")
 
+        if context.scene.comfy_inputs:
+            layout.separator()
+            layout.label(text="Inputs:")
+            for item in context.scene.comfy_inputs:
+                layout.prop(item, "value", text=item.label)
+
 
 classes = [
+    ComfyInput,
     COMFY_OT_check_connection,
     COMFY_OT_load_workflow,
     COMFY_PT_main_panel,
@@ -81,6 +139,7 @@ def register():
         name="Workflow Path",
         subtype="FILE_PATH",
     )
+    bpy.types.Scene.comfy_inputs = CollectionProperty(type=ComfyInput)
 
 
 def unregister():
@@ -88,6 +147,7 @@ def unregister():
         bpy.utils.unregister_class(cls)
     del bpy.types.Scene.comfy_server_url
     del bpy.types.Scene.comfy_workflow_path
+    del bpy.types.Scene.comfy_inputs
 
 
 if __name__ == "__main__":
