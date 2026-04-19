@@ -115,6 +115,23 @@ class COMFY_OT_load_workflow(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class COMFY_OT_cancel_workflow(bpy.types.Operator):
+    """Interrupt the currently running ComfyUI workflow"""
+    bl_idname = "comfy.cancel_workflow"
+    bl_label = "Cancel"
+
+    def execute(self, context):
+        url = f"{context.scene.comfy_server_url}/interrupt"
+        try:
+            req = urllib.request.Request(url, data=b"", method="POST")
+            urllib.request.urlopen(req, timeout=5)
+            self.report({"INFO"}, "Sent interrupt to ComfyUI")
+        except urllib.error.URLError as e:
+            self.report({"ERROR"}, f"Could not cancel: {e}")
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
 class COMFY_OT_run_workflow(bpy.types.Operator):
     """Submit the workflow to ComfyUI"""
     bl_idname = "comfy.run_workflow"
@@ -182,13 +199,16 @@ class COMFY_PT_main_panel(bpy.types.Panel):
                 layout.prop(item, "value", text=item.label)
 
             layout.separator()
-            layout.operator("comfy.run_workflow", icon="PLAY")
+            row = layout.row(align=True)
+            row.operator("comfy.run_workflow", icon="PLAY")
+            row.operator("comfy.cancel_workflow", icon="X")
 
 
 classes = [
     ComfyInput,
     COMFY_OT_check_connection,
     COMFY_OT_load_workflow,
+    COMFY_OT_cancel_workflow,
     COMFY_OT_run_workflow,
     COMFY_PT_main_panel,
 ]
