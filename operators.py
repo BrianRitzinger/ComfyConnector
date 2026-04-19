@@ -1,7 +1,7 @@
 import bpy
 import json
 from bpy.props import StringProperty
-from . import comfy_api
+from . import comfy_api, previews
 
 
 class COMFY_OT_check_connection(bpy.types.Operator):
@@ -68,6 +68,10 @@ class COMFY_OT_run_workflow(bpy.types.Operator):
             self.report({"ERROR"}, "No workflow loaded")
             return {"CANCELLED"}
 
+        if not scene.comfy_output_dir:
+            self.report({"ERROR"}, "No output folder set")
+            return {"CANCELLED"}
+
         try:
             workflow = comfy_api.build_prompt(scene.comfy_workflow_path, scene.comfy_inputs)
         except Exception as e:
@@ -80,6 +84,7 @@ class COMFY_OT_run_workflow(bpy.types.Operator):
             return {"CANCELLED"}
 
         self.report({"INFO"}, f"Workflow queued — prompt_id: {prompt_id}")
+        _start_polling(scene.comfy_server_url, prompt_id, scene.comfy_output_dir)
         return {"FINISHED"}
 
 
@@ -97,11 +102,115 @@ class COMFY_OT_cancel_workflow(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class COMFY_OT_set_background(bpy.types.Operator):
+    """Set the selected image as the 3D viewport background"""
+    bl_idname = "comfy.set_background"
+    bl_label = "Set as Background"
+
+    def execute(self, context):
+        scene = context.scene
+        if not scene.comfy_images:
+            self.report({"ERROR"}, "No images available")
+            return {"CANCELLED"}
+
+        item = scene.comfy_images[scene.comfy_active_image]
+        image = bpy.data.images.load(item.filepath, check_existing=True)
+
+        space = context.space_data
+        if not hasattr(space, "background_images"):
+            self.report({"ERROR"}, "Open a 3D viewport first")
+            return {"CANCELLED"}
+
+        space.show_background_images = True
+        bg = space.background_images.new()
+        bg.image = image
+        self.report({"INFO"}, f"Set background: {item.name}")
+        return {"FINISHED"}
+
+
+class COMFY_OT_apply_texture(bpy.types.Operator):
+    """Apply the selected image as a texture on the active object"""
+    bl_idname = "comfy.apply_texture"
+    bl_label = "Apply as Texture"
+
+    def execute(self, context):
+        scene = context.scene
+        obj = context.active_object
+
+        if not scene.comfy_images:
+            self.report({"ERROR"}, "No images available")
+            return {"CANCELLED"}
+
+        if not obj or not hasattr(obj.data, "materials"):
+            self.report({"ERROR"}, "Select a mesh object first")
+            return {"CANCELLED"}
+
+        item = scene.comfy_images[scene.comfy_active_image]
+        image = bpy.data.images.load(item.filepath, check_existing=True)
+
+        if obj.data.materials:
+            mat = obj.data.materials[0]
+        else:
+            mat = bpy.data.materials.new(name="ComfyMaterial")
+            obj.data.materials.append(mat)
+
+        mat.use_nodes = True
+        nodes = mat.node_tree.nodes
+        links = mat.node_tree.links
+        nodes.clear()
+
+        tex_node = nodes.new("ShaderNodeTexImage")
+        bsdf_node = nodes.new("ShaderNodeBsdfPrincipled")
+        out_node = nodes.new("ShaderNodeOutputMaterial")
+
+        tex_node.image = image
+        tex_node.location = (-300, 0)
+        bsdf_node.location = (0, 0)
+        out_node.location = (300, 0)
+
+        links.new(tex_node.outputs["Color"], bsdf_node.inputs["Base Color"])
+        links.new(bsdf_node.outputs["BSDF"], out_node.inputs["Surface"])
+
+        self.report({"INFO"}, f"Applied texture: {item.name}")
+        return {"FINISHED"}
+
+
+def _start_polling(server_url: str, prompt_id: str, output_dir: str):
+    """Register a Blender timer to poll for workflow completion."""
+    def poll():
+        history = comfy_api.get_history(server_url, prompt_id)
+        if history is None:
+            return 2.0  # not done yet, check again in 2 seconds
+
+        for node_outputs in history.get("outputs", {}).values():
+            for img_info in node_outputs.get("images", []):
+                if img_info.get("type") != "output":
+                    continue
+                filepath = comfy_api.download_image(server_url, img_info, output_dir)
+                if not filepath:
+                    continue
+                scene = bpy.context.scene
+                entry = scene.comfy_images.add()
+                entry.name = img_info["filename"]
+                entry.filepath = filepath
+                entry.prompt_id = prompt_id
+                previews.load_preview(filepath)
+
+        for area in bpy.context.screen.areas:
+            area.tag_redraw()
+
+        return None  # stop timer
+
+    bpy.app.timers.register(poll, first_interval=2.0)
+
+
 classes = [
     COMFY_OT_check_connection,
     COMFY_OT_load_workflow,
     COMFY_OT_run_workflow,
     COMFY_OT_cancel_workflow,
+    COMFY_OT_set_background,
+    COMFY_OT_apply_texture,
 ]
 
 

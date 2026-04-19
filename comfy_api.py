@@ -1,6 +1,8 @@
 import json
+import os
 import urllib.request
 import urllib.error
+import urllib.parse
 
 CC_PREFIX = "[CC]"
 COMFY_URL_DEFAULT = "http://localhost:8188"
@@ -41,6 +43,38 @@ def interrupt(server_url: str) -> str | None:
         return None
     except urllib.error.URLError as e:
         return str(e)
+
+
+def get_history(server_url: str, prompt_id: str) -> dict | None:
+    """Returns output dict if generation is complete, None if still running."""
+    try:
+        with urllib.request.urlopen(f"{server_url}/history/{prompt_id}", timeout=5) as response:
+            data = json.loads(response.read())
+        entry = data.get(prompt_id, {})
+        if entry.get("status", {}).get("completed"):
+            return entry
+        return None
+    except urllib.error.URLError:
+        return None
+
+
+def download_image(server_url: str, img_info: dict, output_dir: str) -> str | None:
+    """Download one image from ComfyUI and save to output_dir. Returns filepath or None."""
+    params = urllib.parse.urlencode({
+        "filename": img_info["filename"],
+        "subfolder": img_info.get("subfolder", ""),
+        "type": img_info.get("type", "output"),
+    })
+    try:
+        with urllib.request.urlopen(f"{server_url}/view?{params}", timeout=30) as response:
+            data = response.read()
+        os.makedirs(output_dir, exist_ok=True)
+        filepath = os.path.join(output_dir, img_info["filename"])
+        with open(filepath, "wb") as f:
+            f.write(data)
+        return filepath
+    except Exception:
+        return None
 
 
 def scan_workflow_inputs(workflow: dict) -> list[dict]:
