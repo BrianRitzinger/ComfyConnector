@@ -10,7 +10,7 @@ A Blender addon that connects to ComfyUI, allowing you to generate AI images fro
 
 ## Requirements
 
-- Blender 4.x
+- Blender 5.1+
 - ComfyUI running locally (default: http://localhost:8188)
 
 ## Status

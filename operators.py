@@ -177,6 +177,8 @@ class COMFY_OT_apply_texture(bpy.types.Operator):
 
 def _start_polling(server_url: str, prompt_id: str, output_dir: str):
     """Register a Blender timer to poll for workflow completion."""
+    # TODO: add a max-poll-count or wall-clock timeout so the timer stops if
+    # ComfyUI never completes the prompt (e.g. queue stall, server crash).
     def poll():
         history = comfy_api.get_history(server_url, prompt_id)
         if history is None:
