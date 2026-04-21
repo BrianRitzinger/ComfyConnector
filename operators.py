@@ -48,6 +48,7 @@ class COMFY_OT_load_workflow(bpy.types.Operator):
             entry.input_key = item["input_key"]
             entry.label = item["label"]
             entry.value = item["value"]
+            entry.class_type = item["class_type"]
 
         if found:
             self.report({"INFO"}, f"Loaded {len(found)} [CC] input(s) from workflow")
@@ -73,7 +74,7 @@ class COMFY_OT_run_workflow(bpy.types.Operator):
             return {"CANCELLED"}
 
         try:
-            workflow = comfy_api.build_prompt(scene.comfy_workflow_path, scene.comfy_inputs)
+            workflow = comfy_api.build_prompt(scene.comfy_workflow_path, scene.comfy_inputs, scene.comfy_server_url)
         except Exception as e:
             self.report({"ERROR"}, f"Could not build workflow: {e}")
             return {"CANCELLED"}
@@ -136,6 +137,9 @@ class COMFY_OT_render_control(bpy.types.Operator):
                 bpy.ops.render.render(write_still=True)
 
             scene.comfy_control_path = output_path
+            for item in scene.comfy_inputs:
+                if item.class_type == "LoadImage":
+                    item.value = output_path
             self.report({"INFO"}, f"Control image saved: {filename}")
 
         except Exception as e:

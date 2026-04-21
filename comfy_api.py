@@ -77,14 +77,50 @@ def download_image(server_url: str, img_info: dict, output_dir: str) -> str | No
         return None
 
 
+def upload_image(server_url: str, filepath: str) -> tuple[str, str | None]:
+    """Upload a local image to ComfyUI's input folder. Returns (server_filename, error)."""
+    filename = os.path.basename(filepath)
+    boundary = "----ComfyConnectorBoundary"
+
+    with open(filepath, "rb") as f:
+        file_data = f.read()
+
+    body = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="image"; filename="{filename}"\r\n'
+        f"Content-Type: image/png\r\n"
+        f"\r\n"
+    ).encode() + file_data + (
+        f"\r\n--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="type"\r\n\r\ninput\r\n'
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="overwrite"\r\n\r\ntrue\r\n'
+        f"--{boundary}--\r\n"
+    ).encode()
+
+    req = urllib.request.Request(
+        f"{server_url}/upload/image",
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            result = json.loads(response.read())
+        return result["name"], None
+    except Exception as e:
+        return "", str(e)
+
+
 def scan_workflow_inputs(workflow: dict) -> list[dict]:
-    """Return list of {node_id, input_key, label, value} for all [CC] tagged nodes."""
+    """Return list of {node_id, input_key, label, value, class_type} for all [CC] tagged nodes."""
     inputs = []
     for node_id, node in workflow.items():
         title = node.get("_meta", {}).get("title", "")
         if CC_PREFIX not in title:
             continue
         label = title.replace(CC_PREFIX, "").strip()
+        class_type = node.get("class_type", "")
         for key, value in node.get("inputs", {}).items():
             if isinstance(value, list):
                 continue  # skip node-to-node links
@@ -93,12 +129,16 @@ def scan_workflow_inputs(workflow: dict) -> list[dict]:
                 "input_key": key,
                 "label": f"{label} — {key}",
                 "value": str(value),
+                "class_type": class_type,
             })
     return inputs
 
 
-def build_prompt(workflow_path: str, inputs) -> dict:
-    """Load workflow JSON and patch in current [CC] input values."""
+def build_prompt(workflow_path: str, inputs, server_url: str = "") -> dict:
+    """Load workflow JSON and patch in current [CC] input values.
+
+    If server_url is provided, local file paths on LoadImage nodes are uploaded automatically.
+    """
     with open(workflow_path, "r") as f:
         workflow = json.load(f)
 
@@ -106,6 +146,14 @@ def build_prompt(workflow_path: str, inputs) -> dict:
         node = workflow.get(item.node_id)
         if not node:
             continue
+
+        # Auto-upload local files for LoadImage nodes
+        if server_url and node.get("class_type") == "LoadImage" and os.path.isfile(item.value):
+            server_name, error = upload_image(server_url, item.value)
+            if not error:
+                node["inputs"][item.input_key] = server_name
+                continue
+
         original = node["inputs"].get(item.input_key)
         # bool must be checked before int — bool is a subclass of int in Python
         if isinstance(original, bool):

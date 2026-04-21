@@ -10,6 +10,7 @@ class ComfyInput(PropertyGroup):
     input_key: StringProperty()
     label: StringProperty()
     value: StringProperty()
+    class_type: StringProperty()
 
 
 class ComfyImage(PropertyGroup):
