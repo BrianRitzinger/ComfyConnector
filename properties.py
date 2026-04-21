@@ -1,5 +1,5 @@
 import bpy
-from bpy.props import StringProperty, CollectionProperty, IntProperty
+from bpy.props import StringProperty, CollectionProperty, IntProperty, EnumProperty
 from bpy.types import PropertyGroup
 from .comfy_api import COMFY_URL_DEFAULT
 
@@ -44,6 +44,19 @@ def register():
         min=2,
         max=20,
     )
+    bpy.types.Scene.comfy_control_mode = EnumProperty(
+        name="Control Mode",
+        items=[
+            ('NORMAL', 'Normal Map', 'Render surface normals — use with normal ControlNet models'),
+            ('RENDER', 'Full Render', 'Render using current scene settings — use ComfyUI preprocessors for depth/canny'),
+        ],
+        default='NORMAL',
+    )
+    bpy.types.Scene.comfy_control_path = StringProperty(
+        name="Control Image Path",
+        subtype="FILE_PATH",
+        default="",
+    )
 
 
 def unregister():
@@ -56,3 +69,5 @@ def unregister():
     del bpy.types.Scene.comfy_images
     del bpy.types.Scene.comfy_active_image
     del bpy.types.Scene.comfy_icon_scale
+    del bpy.types.Scene.comfy_control_mode
+    del bpy.types.Scene.comfy_control_path

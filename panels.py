@@ -45,6 +45,13 @@ class COMFY_PT_main_panel(bpy.types.Panel):
             layout.prop(scene, "comfy_output_dir", text="")
 
             layout.separator()
+            layout.label(text="Control Image:")
+            layout.prop(scene, "comfy_control_mode", text="")
+            layout.operator("comfy.render_control", icon="RENDER_STILL")
+            if scene.comfy_control_path:
+                layout.label(text=scene.comfy_control_path, icon="IMAGE_DATA")
+
+            layout.separator()
             row = layout.row(align=True)
             row.operator("comfy.run_workflow", icon="PLAY")
             row.operator("comfy.cancel_workflow", icon="X")

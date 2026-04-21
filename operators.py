@@ -102,6 +102,96 @@ class COMFY_OT_cancel_workflow(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class COMFY_OT_render_control(bpy.types.Operator):
+    """Render a control image from the active camera for ControlNet"""
+    bl_idname = "comfy.render_control"
+    bl_label = "Render Control Image"
+
+    def execute(self, context):
+        import os
+        scene = context.scene
+
+        if not scene.comfy_output_dir:
+            self.report({"ERROR"}, "No output folder set")
+            return {"CANCELLED"}
+
+        if not scene.camera:
+            self.report({"ERROR"}, "No active camera in scene")
+            return {"CANCELLED"}
+
+        mode = scene.comfy_control_mode
+        filename = f"control_{mode.lower()}.png"
+        output_path = os.path.join(bpy.path.abspath(scene.comfy_output_dir), filename)
+
+        orig_filepath = scene.render.filepath
+        orig_format = scene.render.image_settings.file_format
+
+        try:
+            scene.render.filepath = output_path
+            scene.render.image_settings.file_format = 'PNG'
+
+            if mode == 'NORMAL':
+                _render_normal_map(scene)
+            else:
+                bpy.ops.render.render(write_still=True)
+
+            scene.comfy_control_path = output_path
+            self.report({"INFO"}, f"Control image saved: {filename}")
+
+        except Exception as e:
+            self.report({"ERROR"}, f"Render failed: {e}")
+            return {"CANCELLED"}
+
+        finally:
+            scene.render.filepath = orig_filepath
+            scene.render.image_settings.file_format = orig_format
+
+        return {"FINISHED"}
+
+
+def _render_normal_map(scene):
+    """Render world-space normals by temporarily overriding all mesh materials."""
+    # Build an emission material that outputs world-space normals as 0-1 color
+    mat = bpy.data.materials.new("_comfy_normal_temp")
+    mat.use_nodes = True
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    nodes.clear()
+
+    geo    = nodes.new("ShaderNodeNewGeometry")
+    scale  = nodes.new("ShaderNodeVectorMath")
+    scale.operation = 'SCALE'
+    scale.inputs['Scale'].default_value = 0.5
+    add    = nodes.new("ShaderNodeVectorMath")
+    add.operation = 'ADD'
+    add.inputs[1].default_value = (0.5, 0.5, 0.5)
+    emit   = nodes.new("ShaderNodeEmission")
+    out    = nodes.new("ShaderNodeOutputMaterial")
+
+    links.new(geo.outputs['Normal'],   scale.inputs['Vector'])
+    links.new(scale.outputs['Vector'], add.inputs[0])
+    links.new(add.outputs['Vector'],   emit.inputs['Color'])
+    links.new(emit.outputs['Emission'], out.inputs['Surface'])
+
+    # Save and replace materials on every mesh
+    saved = {}
+    for obj in scene.objects:
+        if obj.type == 'MESH':
+            saved[obj.name] = list(obj.data.materials)
+            obj.data.materials.clear()
+            obj.data.materials.append(mat)
+
+    try:
+        bpy.ops.render.render(write_still=True)
+    finally:
+        for obj in scene.objects:
+            if obj.type == 'MESH' and obj.name in saved:
+                obj.data.materials.clear()
+                for m in saved[obj.name]:
+                    obj.data.materials.append(m)
+        bpy.data.materials.remove(mat)
+
+
 class COMFY_OT_set_background(bpy.types.Operator):
     """Set the selected image as the active camera background"""
     bl_idname = "comfy.set_background"
@@ -207,6 +297,7 @@ def _start_polling(server_url: str, prompt_id: str, output_dir: str):
 
 
 classes = [
+    COMFY_OT_render_control,
     COMFY_OT_check_connection,
     COMFY_OT_load_workflow,
     COMFY_OT_run_workflow,
