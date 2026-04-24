@@ -269,6 +269,59 @@ class COMFY_OT_apply_texture(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class COMFY_OT_project_texture(bpy.types.Operator):
+    """Project the selected image onto the active object from the camera's viewpoint"""
+    bl_idname = "comfy.project_texture"
+    bl_label = "Project from Camera"
+
+    def execute(self, context):
+        scene = context.scene
+        obj = context.active_object
+
+        if not scene.comfy_images:
+            self.report({"ERROR"}, "No images available")
+            return {"CANCELLED"}
+
+        if not obj or not hasattr(obj.data, "materials"):
+            self.report({"ERROR"}, "Select a mesh object first")
+            return {"CANCELLED"}
+
+        item = scene.comfy_images[scene.comfy_active_image]
+        image = bpy.data.images.load(item.filepath, check_existing=True)
+
+        mat = bpy.data.materials.new(name=f"ComfyProjection_{item.name}")
+        mat.use_nodes = True
+        nodes = mat.node_tree.nodes
+        links = mat.node_tree.links
+        nodes.clear()
+
+        coord_node = nodes.new("ShaderNodeTexCoord")
+        tex_node = nodes.new("ShaderNodeTexImage")
+        bsdf_node = nodes.new("ShaderNodeBsdfPrincipled")
+        out_node = nodes.new("ShaderNodeOutputMaterial")
+
+        coord_node.location = (-600, 0)
+        tex_node.location = (-300, 0)
+        bsdf_node.location = (0, 0)
+        out_node.location = (300, 0)
+
+        tex_node.image = image
+
+        # Window coordinates map exactly to the render camera's screen space (0-1),
+        # so the AI image — generated from that same view — projects back correctly.
+        links.new(coord_node.outputs["Window"], tex_node.inputs["Vector"])
+        links.new(tex_node.outputs["Color"], bsdf_node.inputs["Base Color"])
+        links.new(bsdf_node.outputs["BSDF"], out_node.inputs["Surface"])
+
+        if obj.data.materials:
+            obj.data.materials[0] = mat
+        else:
+            obj.data.materials.append(mat)
+
+        self.report({"INFO"}, f"Projection material set on '{obj.name}' — look through camera (Numpad 0) to preview")
+        return {"FINISHED"}
+
+
 def _start_polling(server_url: str, prompt_id: str, output_dir: str):
     """Register a Blender timer to poll for workflow completion."""
     # TODO: add a max-poll-count or wall-clock timeout so the timer stops if
@@ -308,6 +361,7 @@ classes = [
     COMFY_OT_cancel_workflow,
     COMFY_OT_set_background,
     COMFY_OT_apply_texture,
+    COMFY_OT_project_texture,
 ]
 
 
