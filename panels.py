@@ -74,6 +74,7 @@ class COMFY_PT_main_panel(bpy.types.Panel):
             row = layout.row(align=True)
             row.operator("comfy.set_background", icon="IMAGE_BACKGROUND")
             row.operator("comfy.apply_texture", icon="MATERIAL")
+            row.operator("comfy.project_texture", icon="VIEW_CAMERA")
 
 
 classes = [
