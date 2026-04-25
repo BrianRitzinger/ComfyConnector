@@ -1,6 +1,6 @@
 import bpy
 import json
-from bpy.props import StringProperty
+from bpy.props import StringProperty, EnumProperty
 from . import comfy_api, previews
 
 
@@ -322,6 +322,175 @@ class COMFY_OT_project_texture(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class COMFY_OT_bake_projection(bpy.types.Operator):
+    """Bake the camera-projected texture into the mesh UV map (requires Cycles)"""
+    bl_idname = "comfy.bake_projection"
+    bl_label = "Bake Projection to UV"
+
+    resolution: EnumProperty(
+        name="Resolution",
+        items=[
+            ('512',  '512 px',  ''),
+            ('1024', '1024 px', ''),
+            ('2048', '2048 px', ''),
+            ('4096', '4096 px', ''),
+        ],
+        default='2048',
+    )
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+    def draw(self, context):
+        self.layout.prop(self, "resolution")
+
+    def execute(self, context):
+        import os
+        scene = context.scene
+        obj = context.active_object
+
+        if not obj or obj.type != 'MESH':
+            self.report({'ERROR'}, "Select a mesh object first")
+            return {'CANCELLED'}
+
+        if not obj.data.materials or not obj.data.materials[0]:
+            self.report({'ERROR'}, "No material — run 'Project from Camera' first")
+            return {'CANCELLED'}
+
+        source_img = next(
+            (n.image for n in obj.data.materials[0].node_tree.nodes
+             if n.type == 'TEX_IMAGE' and n.image),
+            None
+        )
+        if not source_img:
+            self.report({'ERROR'}, "No image texture in material — run 'Project from Camera' first")
+            return {'CANCELLED'}
+
+        if not scene.camera:
+            self.report({'ERROR'}, "No active camera in scene")
+            return {'CANCELLED'}
+
+        if not scene.comfy_output_dir:
+            self.report({'ERROR'}, "No output folder set")
+            return {'CANCELLED'}
+
+        orig_engine = scene.render.engine
+        scene.render.engine = 'CYCLES'
+        mesh = obj.data
+
+        # Auto-create UV map if the mesh has none
+        if not mesh.uv_layers:
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.select_all(action='SELECT')
+            bpy.ops.uv.smart_project(angle_limit=66.0, island_margin=0.02)
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        uv_layer_name = mesh.uv_layers.active.name
+
+        # UV Project modifier: drives the active UV layer from camera space during baking.
+        # This is needed because Window texture coordinates don't work correctly during
+        # baking (Blender shoots rays from the mesh, not from the camera viewpoint).
+        uv_mod = obj.modifiers.new("_comfy_uvproj_temp", 'UV_PROJECT')
+        uv_mod.uv_layer = uv_layer_name
+        uv_mod.projectors[0].object = scene.camera
+        rx, ry = scene.render.resolution_x, scene.render.resolution_y
+        if rx >= ry:
+            uv_mod.aspect_x = rx / ry
+            uv_mod.aspect_y = 1.0
+        else:
+            uv_mod.aspect_x = 1.0
+            uv_mod.aspect_y = ry / rx
+
+        # Temporary emission material: UV-sampled source image → Emission.
+        # Emission + Emit bake captures raw colour with zero lighting influence,
+        # avoiding the "dark bake" problem caused by Combined or lit Diffuse bakes.
+        bake_mat = bpy.data.materials.new("_comfy_bake_temp")
+        bake_mat.use_nodes = True
+        bm_nodes = bake_mat.node_tree.nodes
+        bm_links = bake_mat.node_tree.links
+        bm_nodes.clear()
+
+        bm_tex = bm_nodes.new('ShaderNodeTexImage')
+        bm_tex.image = source_img
+        bm_tex.location = (-300, 100)
+
+        bm_emit = bm_nodes.new('ShaderNodeEmission')
+        bm_emit.location = (0, 100)
+
+        bm_out = bm_nodes.new('ShaderNodeOutputMaterial')
+        bm_out.location = (300, 100)
+
+        bm_links.new(bm_tex.outputs['Color'], bm_emit.inputs['Color'])
+        bm_links.new(bm_emit.outputs['Emission'], bm_out.inputs['Surface'])
+
+        # Bake target: Image Texture node that is selected + active but NOT connected.
+        # Blender writes the bake result into whichever image node is active.
+        size = int(self.resolution)
+        img_name = f"ComfyBake_{obj.name}"
+        if img_name in bpy.data.images:
+            bpy.data.images.remove(bpy.data.images[img_name])
+        bake_img = bpy.data.images.new(img_name, width=size, height=size)
+
+        bake_node = bm_nodes.new('ShaderNodeTexImage')
+        bake_node.image = bake_img
+        bake_node.location = (-300, -200)
+        for n in bm_nodes:
+            n.select = False
+        bake_node.select = True
+        bm_nodes.active = bake_node
+
+        original_mat = obj.data.materials[0]
+        obj.data.materials[0] = bake_mat
+
+        try:
+            scene.render.bake.margin = 16
+            bpy.ops.object.bake(type='EMIT')
+
+            out_path = os.path.join(bpy.path.abspath(scene.comfy_output_dir), f"{img_name}.png")
+            bake_img.filepath_raw = out_path
+            bake_img.file_format = 'PNG'
+            bake_img.save()
+
+        except Exception as e:
+            self.report({'ERROR'}, f"Bake failed: {e}")
+            obj.data.materials[0] = original_mat
+            bpy.data.materials.remove(bake_mat)
+            obj.modifiers.remove(uv_mod)
+            scene.render.engine = orig_engine
+            return {'CANCELLED'}
+
+        finally:
+            obj.modifiers.remove(uv_mod)
+            scene.render.engine = orig_engine
+
+        # Replace the projection material with a clean UV-mapped material
+        # using the baked image — now view-independent and ready to export.
+        final_mat = bpy.data.materials.new(f"ComfyBaked_{obj.name}")
+        final_mat.use_nodes = True
+        fn = final_mat.node_tree.nodes
+        fl = final_mat.node_tree.links
+        fn.clear()
+
+        f_tex = fn.new('ShaderNodeTexImage')
+        f_tex.image = bake_img
+        f_tex.location = (-300, 0)
+
+        f_bsdf = fn.new('ShaderNodeBsdfPrincipled')
+        f_bsdf.location = (0, 0)
+
+        f_out = fn.new('ShaderNodeOutputMaterial')
+        f_out.location = (300, 0)
+
+        fl.new(f_tex.outputs['Color'], f_bsdf.inputs['Base Color'])
+        fl.new(f_bsdf.outputs['BSDF'], f_out.inputs['Surface'])
+
+        obj.data.materials[0] = final_mat
+        bpy.data.materials.remove(bake_mat)
+
+        self.report({'INFO'}, f"Baked to '{img_name}.png' and applied as UV material")
+        return {'FINISHED'}
+
+
 def _start_polling(server_url: str, prompt_id: str, output_dir: str):
     """Register a Blender timer to poll for workflow completion."""
     # TODO: add a max-poll-count or wall-clock timeout so the timer stops if
@@ -362,6 +531,7 @@ classes = [
     COMFY_OT_set_background,
     COMFY_OT_apply_texture,
     COMFY_OT_project_texture,
+    COMFY_OT_bake_projection,
 ]
 
 
