@@ -12,6 +12,20 @@ class COMFY_UL_image_list(bpy.types.UIList):
                 layout.label(text=item.name, icon="IMAGE")
 
 
+class COMFY_UL_camera_slot_list(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname):
+        if self.layout_type in {"DEFAULT", "COMPACT"}:
+            row = layout.row(align=True)
+            row.prop(item, "camera", text="")
+            scene = context.scene
+            idx = item.image_index
+            if scene.comfy_images and 0 <= idx < len(scene.comfy_images):
+                row.label(text=scene.comfy_images[idx].name)
+            else:
+                row.label(text="—", icon="IMAGE")
+            row.prop(item, "image_index", text="")
+
+
 class COMFY_PT_main_panel(bpy.types.Panel):
     """Main ComfyConnector panel in the 3D viewport sidebar"""
     bl_label = "ComfyUI"
@@ -77,9 +91,24 @@ class COMFY_PT_main_panel(bpy.types.Panel):
             row.operator("comfy.project_texture", icon="VIEW_CAMERA")
             layout.operator("comfy.bake_projection", icon="RENDER_STILL")
 
+        layout.separator()
+        layout.label(text="Multi-Camera Projection:")
+        layout.template_list(
+            "COMFY_UL_camera_slot_list", "",
+            scene, "comfy_camera_slots",
+            scene, "comfy_active_camera_slot",
+            rows=3,
+        )
+        row = layout.row(align=True)
+        row.operator("comfy.add_camera_slot", icon="ADD", text="Add Slot")
+        row.operator("comfy.remove_camera_slot", icon="REMOVE", text="Remove")
+        if len(scene.comfy_camera_slots) >= 2:
+            layout.operator("comfy.bake_multi_projection", icon="RENDER_STILL")
+
 
 classes = [
     COMFY_UL_image_list,
+    COMFY_UL_camera_slot_list,
     COMFY_PT_main_panel,
 ]
 
