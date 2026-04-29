@@ -1,7 +1,17 @@
 import bpy
-from bpy.props import StringProperty, CollectionProperty, IntProperty, EnumProperty
+from bpy.props import StringProperty, CollectionProperty, IntProperty, EnumProperty, PointerProperty
 from bpy.types import PropertyGroup
 from .comfy_api import COMFY_URL_DEFAULT
+
+
+class ComfyCameraSlot(PropertyGroup):
+    """One camera + image pair for multi-camera projection baking"""
+    camera: PointerProperty(
+        name="Camera",
+        type=bpy.types.Object,
+        poll=lambda self, obj: obj.type == 'CAMERA',
+    )
+    image_index: IntProperty(name="Img #", default=0, min=0)
 
 
 class ComfyInput(PropertyGroup):
@@ -21,6 +31,7 @@ class ComfyImage(PropertyGroup):
 
 
 def register():
+    bpy.utils.register_class(ComfyCameraSlot)
     bpy.utils.register_class(ComfyInput)
     bpy.utils.register_class(ComfyImage)
     bpy.types.Scene.comfy_server_url = StringProperty(
@@ -58,9 +69,12 @@ def register():
         subtype="FILE_PATH",
         default="",
     )
+    bpy.types.Scene.comfy_camera_slots = CollectionProperty(type=ComfyCameraSlot)
+    bpy.types.Scene.comfy_active_camera_slot = IntProperty(default=0)
 
 
 def unregister():
+    bpy.utils.unregister_class(ComfyCameraSlot)
     bpy.utils.unregister_class(ComfyInput)
     bpy.utils.unregister_class(ComfyImage)
     del bpy.types.Scene.comfy_server_url
@@ -72,3 +86,5 @@ def unregister():
     del bpy.types.Scene.comfy_icon_scale
     del bpy.types.Scene.comfy_control_mode
     del bpy.types.Scene.comfy_control_path
+    del bpy.types.Scene.comfy_camera_slots
+    del bpy.types.Scene.comfy_active_camera_slot

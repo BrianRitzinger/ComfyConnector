@@ -528,6 +528,304 @@ class COMFY_OT_set_control_image(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class COMFY_OT_add_camera_slot(bpy.types.Operator):
+    """Add a camera/image slot for multi-camera projection"""
+    bl_idname = "comfy.add_camera_slot"
+    bl_label = "Add Camera Slot"
+
+    def execute(self, context):
+        context.scene.comfy_camera_slots.add()
+        return {'FINISHED'}
+
+
+class COMFY_OT_remove_camera_slot(bpy.types.Operator):
+    """Remove the selected camera/image slot"""
+    bl_idname = "comfy.remove_camera_slot"
+    bl_label = "Remove Camera Slot"
+
+    def execute(self, context):
+        scene = context.scene
+        idx = scene.comfy_active_camera_slot
+        if 0 <= idx < len(scene.comfy_camera_slots):
+            scene.comfy_camera_slots.remove(idx)
+            scene.comfy_active_camera_slot = max(0, idx - 1)
+        return {'FINISHED'}
+
+
+class COMFY_OT_bake_multi_projection(bpy.types.Operator):
+    """Bake blended camera projections into a single UV-mapped texture (requires Cycles)"""
+    bl_idname = "comfy.bake_multi_projection"
+    bl_label = "Bake Multi-Camera Projection"
+
+    resolution: EnumProperty(
+        name="Resolution",
+        items=[
+            ('512',  '512 px',  ''),
+            ('1024', '1024 px', ''),
+            ('2048', '2048 px', ''),
+            ('4096', '4096 px', ''),
+        ],
+        default='2048',
+    )
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+    def draw(self, context):
+        self.layout.prop(self, "resolution")
+
+    def execute(self, context):
+        import os
+        from mathutils import Vector
+
+        scene = context.scene
+        obj = context.active_object
+        slots = scene.comfy_camera_slots
+
+        if len(slots) < 2:
+            self.report({'ERROR'}, "Add at least 2 camera slots")
+            return {'CANCELLED'}
+
+        for i, slot in enumerate(slots):
+            if not slot.camera:
+                self.report({'ERROR'}, f"Slot {i + 1}: no camera assigned")
+                return {'CANCELLED'}
+            if not (0 <= slot.image_index < len(scene.comfy_images)):
+                self.report({'ERROR'}, f"Slot {i + 1}: image index out of range")
+                return {'CANCELLED'}
+
+        if not obj or obj.type != 'MESH':
+            self.report({'ERROR'}, "Select a mesh object first")
+            return {'CANCELLED'}
+
+        if not scene.comfy_output_dir:
+            self.report({'ERROR'}, "No output folder set")
+            return {'CANCELLED'}
+
+        orig_engine = scene.render.engine
+        scene.render.engine = 'CYCLES'
+        mesh = obj.data
+        rx, ry = scene.render.resolution_x, scene.render.resolution_y
+        N = len(slots)
+
+        # --- UV layers: one per camera (for projection), one for the bake target ---
+        proj_uv_layers = []
+        for i in range(N):
+            name = f"ComfyProj_{i}"
+            layer = mesh.uv_layers.get(name) or mesh.uv_layers.new(name=name)
+            proj_uv_layers.append(layer)
+
+        bake_uv_name = "ComfyBakeUV"
+        bake_uv = mesh.uv_layers.get(bake_uv_name)
+        if not bake_uv:
+            bake_uv = mesh.uv_layers.new(name=bake_uv_name)
+            mesh.uv_layers.active = bake_uv
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.select_all(action='SELECT')
+            bpy.ops.uv.smart_project(angle_limit=66.0, island_margin=0.02)
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        # --- UV Project modifiers: one per camera, writing to ComfyProj_i ---
+        uv_mods = []
+        for i, slot in enumerate(slots):
+            mod = obj.modifiers.new(f"_comfy_uvproj_{i}", 'UV_PROJECT')
+            mod.uv_layer = proj_uv_layers[i].name
+            mod.projectors[0].object = slot.camera
+            if rx >= ry:
+                mod.aspect_x = rx / ry
+                mod.aspect_y = 1.0
+            else:
+                mod.aspect_x = 1.0
+                mod.aspect_y = ry / rx
+            uv_mods.append(mod)
+
+        # Pre-compute each camera's world-space forward direction (into the scene = -Z).
+        # These are baked as constants into the shader because the camera doesn't move
+        # during the bake pass.
+        cam_forwards = []
+        for slot in slots:
+            fwd = -(slot.camera.matrix_world.col[2].to_3d().normalized())
+            cam_forwards.append(tuple(fwd))
+
+        source_images = []
+        for slot in slots:
+            entry = scene.comfy_images[slot.image_index]
+            source_images.append(bpy.data.images.load(entry.filepath, check_existing=True))
+
+        # --- Build temporary emission material with normal-weighted blend ---
+        bake_mat = bpy.data.materials.new("_comfy_multi_bake_temp")
+        bake_mat.use_nodes = True
+        nodes = bake_mat.node_tree.nodes
+        links = bake_mat.node_tree.links
+        nodes.clear()
+
+        col_x, row_h = -1400, 160
+
+        geo = nodes.new('ShaderNodeNewGeometry')
+        geo.location = (col_x, 0)
+
+        # Per-camera: clamp(dot(face_normal, cam_forward), 0, inf)
+        raw_weight_sockets = []
+        for i, fwd in enumerate(cam_forwards):
+            dot = nodes.new('ShaderNodeVectorMath')
+            dot.operation = 'DOT_PRODUCT'
+            dot.inputs[1].default_value = fwd
+            dot.location = (col_x + 200, -i * row_h)
+            links.new(geo.outputs['Normal'], dot.inputs[0])
+
+            clamp = nodes.new('ShaderNodeMath')
+            clamp.operation = 'MAXIMUM'
+            clamp.inputs[1].default_value = 0.0
+            clamp.location = (col_x + 400, -i * row_h)
+            links.new(dot.outputs['Value'], clamp.inputs[0])
+            raw_weight_sockets.append(clamp.outputs['Value'])
+
+        # Sum raw weights
+        total = raw_weight_sockets[0]
+        for i in range(1, N):
+            add = nodes.new('ShaderNodeMath')
+            add.operation = 'ADD'
+            add.location = (col_x + 600, -i * 80)
+            links.new(total, add.inputs[0])
+            links.new(raw_weight_sockets[i], add.inputs[1])
+            total = add.outputs['Value']
+
+        # Guard against all-zero (face points away from every camera)
+        safe = nodes.new('ShaderNodeMath')
+        safe.operation = 'MAXIMUM'
+        safe.inputs[1].default_value = 0.001
+        safe.location = (col_x + 800, 80)
+        links.new(total, safe.inputs[0])
+
+        # Normalize
+        norm_sockets = []
+        for i, raw in enumerate(raw_weight_sockets):
+            div = nodes.new('ShaderNodeMath')
+            div.operation = 'DIVIDE'
+            div.location = (col_x + 800, -i * row_h)
+            links.new(raw, div.inputs[0])
+            links.new(safe.outputs['Value'], div.inputs[1])
+            norm_sockets.append(div.outputs['Value'])
+
+        # Per-camera: sample image via projected UV, scale by normalized weight
+        # VectorMath SCALE avoids ShaderNodeMixRGB / ShaderNodeMix API differences
+        weighted_sockets = []
+        for i, (img, uv_layer, norm_w) in enumerate(zip(source_images, proj_uv_layers, norm_sockets)):
+            uv_node = nodes.new('ShaderNodeUVMap')
+            uv_node.uv_map = uv_layer.name
+            uv_node.location = (col_x + 1000, -i * row_h)
+
+            tex = nodes.new('ShaderNodeTexImage')
+            tex.image = img
+            tex.location = (col_x + 1200, -i * row_h)
+            links.new(uv_node.outputs['UV'], tex.inputs['Vector'])
+
+            scale = nodes.new('ShaderNodeVectorMath')
+            scale.operation = 'SCALE'
+            scale.location = (col_x + 1500, -i * row_h)
+            links.new(tex.outputs['Color'], scale.inputs['Vector'])
+            links.new(norm_w, scale.inputs['Scale'])
+            weighted_sockets.append(scale.outputs['Vector'])
+
+        # Sum all weighted colours
+        result = weighted_sockets[0]
+        for i in range(1, N):
+            add = nodes.new('ShaderNodeVectorMath')
+            add.operation = 'ADD'
+            add.location = (col_x + 1700, -i * 80)
+            links.new(result, add.inputs[0])
+            links.new(weighted_sockets[i], add.inputs[1])
+            result = add.outputs['Vector']
+
+        emit = nodes.new('ShaderNodeEmission')
+        emit.location = (col_x + 1900, 0)
+        links.new(result, emit.inputs['Color'])
+
+        mat_out = nodes.new('ShaderNodeOutputMaterial')
+        mat_out.location = (col_x + 2100, 0)
+        links.new(emit.outputs['Emission'], mat_out.inputs['Surface'])
+
+        # Bake target: Image Texture node that is selected + active, NOT connected
+        size = int(self.resolution)
+        img_name = f"ComfyMultiBake_{obj.name}"
+        if img_name in bpy.data.images:
+            bpy.data.images.remove(bpy.data.images[img_name])
+        bake_img = bpy.data.images.new(img_name, width=size, height=size)
+
+        bake_node = nodes.new('ShaderNodeTexImage')
+        bake_node.image = bake_img
+        bake_node.location = (col_x + 1000, -N * row_h - 100)
+        for n in nodes:
+            n.select = False
+        bake_node.select = True
+        nodes.active = bake_node
+
+        original_mat = obj.data.materials[0] if obj.data.materials else None
+        if obj.data.materials:
+            obj.data.materials[0] = bake_mat
+        else:
+            obj.data.materials.append(bake_mat)
+
+        mesh.uv_layers.active = bake_uv
+
+        try:
+            scene.render.bake.margin = 16
+            bpy.ops.object.bake(type='EMIT')
+
+            out_path = os.path.join(
+                bpy.path.abspath(scene.comfy_output_dir),
+                f"{img_name}.png",
+            )
+            bake_img.filepath_raw = out_path
+            bake_img.file_format = 'PNG'
+            bake_img.save()
+
+        except Exception as e:
+            self.report({'ERROR'}, f"Bake failed: {e}")
+            obj.data.materials[0] = original_mat
+            bpy.data.materials.remove(bake_mat)
+            for mod in uv_mods:
+                obj.modifiers.remove(mod)
+            scene.render.engine = orig_engine
+            return {'CANCELLED'}
+
+        finally:
+            for mod in uv_mods:
+                obj.modifiers.remove(mod)
+            scene.render.engine = orig_engine
+
+        # Apply final UV-mapped material using the baked image
+        final_mat = bpy.data.materials.new(f"ComfyMultiBaked_{obj.name}")
+        final_mat.use_nodes = True
+        fn = final_mat.node_tree.nodes
+        fl = final_mat.node_tree.links
+        fn.clear()
+
+        f_uv = fn.new('ShaderNodeUVMap')
+        f_uv.uv_map = bake_uv_name
+        f_uv.location = (-600, 0)
+
+        f_tex = fn.new('ShaderNodeTexImage')
+        f_tex.image = bake_img
+        f_tex.location = (-300, 0)
+
+        f_bsdf = fn.new('ShaderNodeBsdfPrincipled')
+        f_bsdf.location = (0, 0)
+
+        f_out = fn.new('ShaderNodeOutputMaterial')
+        f_out.location = (300, 0)
+
+        fl.new(f_uv.outputs['UV'], f_tex.inputs['Vector'])
+        fl.new(f_tex.outputs['Color'], f_bsdf.inputs['Base Color'])
+        fl.new(f_bsdf.outputs['BSDF'], f_out.inputs['Surface'])
+
+        obj.data.materials[0] = final_mat
+        bpy.data.materials.remove(bake_mat)
+
+        self.report({'INFO'}, f"Multi-projection baked to '{img_name}.png' — UV material applied")
+        return {'FINISHED'}
+
+
 def _start_polling(server_url: str, prompt_id: str, output_dir: str):
     """Register a Blender timer to poll for workflow completion."""
     # TODO: add a max-poll-count or wall-clock timeout so the timer stops if
@@ -570,6 +868,9 @@ classes = [
     COMFY_OT_project_texture,
     COMFY_OT_bake_projection,
     COMFY_OT_set_control_image,
+    COMFY_OT_add_camera_slot,
+    COMFY_OT_remove_camera_slot,
+    COMFY_OT_bake_multi_projection,
 ]
 
 
