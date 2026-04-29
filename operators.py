@@ -138,10 +138,11 @@ class COMFY_OT_render_control(bpy.types.Operator):
             else:
                 bpy.ops.render.render(write_still=True)
 
-            scene.comfy_control_path = output_path
-            for item in scene.comfy_inputs:
-                if item.class_type == "LoadImage":
-                    item.value = output_path
+            entry = scene.comfy_images.add()
+            entry.name = filename
+            entry.filepath = output_path
+            scene.comfy_active_image = len(scene.comfy_images) - 1
+            previews.load_preview(output_path)
             self.report({"INFO"}, f"Control image saved: {filename}")
 
         except Exception as e:

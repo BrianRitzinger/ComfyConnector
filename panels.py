@@ -62,8 +62,6 @@ class COMFY_PT_main_panel(bpy.types.Panel):
             layout.label(text="Control Image:")
             layout.prop(scene, "comfy_control_mode", text="")
             layout.operator("comfy.render_control", icon="RENDER_STILL")
-            if scene.comfy_control_path:
-                layout.label(text=scene.comfy_control_path, icon="IMAGE_DATA")
 
             layout.separator()
             row = layout.row(align=True)
@@ -72,7 +70,7 @@ class COMFY_PT_main_panel(bpy.types.Panel):
 
         if scene.comfy_images:
             layout.separator()
-            layout.label(text="Generated Images:")
+            layout.label(text="Images:")
             layout.template_list(
                 "COMFY_UL_image_list", "",
                 scene, "comfy_images",
