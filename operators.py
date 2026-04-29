@@ -120,8 +120,10 @@ class COMFY_OT_render_control(bpy.types.Operator):
             self.report({"ERROR"}, "No active camera in scene")
             return {"CANCELLED"}
 
+        import datetime
         mode = scene.comfy_control_mode
-        filename = f"control_{mode.lower()}.png"
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"control_{mode.lower()}_{ts}.png"
         output_path = os.path.join(bpy.path.abspath(scene.comfy_output_dir), filename)
 
         orig_filepath = scene.render.filepath
@@ -346,6 +348,8 @@ class COMFY_OT_bake_projection(bpy.types.Operator):
 
     def execute(self, context):
         import os
+        from bpy_extras.object_utils import world_to_camera_view
+
         scene = context.scene
         obj = context.active_object
 
@@ -374,8 +378,6 @@ class COMFY_OT_bake_projection(bpy.types.Operator):
             self.report({'ERROR'}, "No output folder set")
             return {'CANCELLED'}
 
-        orig_engine = scene.render.engine
-        scene.render.engine = 'CYCLES'
         mesh = obj.data
 
         # Auto-create UV map if the mesh has none
@@ -385,30 +387,41 @@ class COMFY_OT_bake_projection(bpy.types.Operator):
             bpy.ops.uv.smart_project(angle_limit=66.0, island_margin=0.02)
             bpy.ops.object.mode_set(mode='OBJECT')
 
-        uv_layer_name = mesh.uv_layers.active.name
+        # The original active UV layer is the bake OUTPUT target (one texel = one UV coord).
+        bake_uv_layer = mesh.uv_layers.active
 
-        # UV Project modifier: drives the active UV layer from camera space during baking.
-        # This is needed because Window texture coordinates don't work correctly during
-        # baking (Blender shoots rays from the mesh, not from the camera viewpoint).
-        uv_mod = obj.modifiers.new("_comfy_uvproj_temp", 'UV_PROJECT')
-        uv_mod.uv_layer = uv_layer_name
-        uv_mod.projectors[0].object = scene.camera
-        rx, ry = scene.render.resolution_x, scene.render.resolution_y
-        if rx >= ry:
-            uv_mod.aspect_x = rx / ry
-            uv_mod.aspect_y = 1.0
-        else:
-            uv_mod.aspect_x = 1.0
-            uv_mod.aspect_y = ry / rx
+        # Compute per-loop camera-projected UVs via world_to_camera_view.
+        # window_to_camera_view is unreliable during baking (Blender shoots rays
+        # from the mesh surface, not from the camera), so we write the projected
+        # coordinates directly into a temporary UV layer and reference it explicitly
+        # in the bake material. This matches the projection material's Window coords.
+        proj_uv_name = "_comfy_proj_uv_temp"
+        if proj_uv_name in mesh.uv_layers:
+            mesh.uv_layers.remove(mesh.uv_layers[proj_uv_name])
+        proj_uv = mesh.uv_layers.new(name=proj_uv_name)
 
-        # Temporary emission material: UV-sampled source image → Emission.
-        # Emission + Emit bake captures raw colour with zero lighting influence,
-        # avoiding the "dark bake" problem caused by Combined or lit Diffuse bakes.
+        cam = scene.camera
+        for poly in mesh.polygons:
+            for loop_idx in poly.loop_indices:
+                vi = mesh.loops[loop_idx].vertex_index
+                world_co = obj.matrix_world @ mesh.vertices[vi].co
+                cam_coord = world_to_camera_view(scene, cam, world_co)
+                proj_uv.data[loop_idx].uv = (cam_coord.x, cam_coord.y)
+
+        # Restore original UV layer as active so the bake writes into it.
+        mesh.uv_layers.active = bake_uv_layer
+
+        # Temporary emission material: proj_uv coords → source image → Emission.
+        # Emission + Emit bake captures raw colour with zero lighting influence.
         bake_mat = bpy.data.materials.new("_comfy_bake_temp")
         bake_mat.use_nodes = True
         bm_nodes = bake_mat.node_tree.nodes
         bm_links = bake_mat.node_tree.links
         bm_nodes.clear()
+
+        bm_uv = bm_nodes.new('ShaderNodeUVMap')
+        bm_uv.uv_map = proj_uv_name
+        bm_uv.location = (-500, 100)
 
         bm_tex = bm_nodes.new('ShaderNodeTexImage')
         bm_tex.image = source_img
@@ -420,6 +433,7 @@ class COMFY_OT_bake_projection(bpy.types.Operator):
         bm_out = bm_nodes.new('ShaderNodeOutputMaterial')
         bm_out.location = (300, 100)
 
+        bm_links.new(bm_uv.outputs['UV'], bm_tex.inputs['Vector'])
         bm_links.new(bm_tex.outputs['Color'], bm_emit.inputs['Color'])
         bm_links.new(bm_emit.outputs['Emission'], bm_out.inputs['Surface'])
 
@@ -439,10 +453,14 @@ class COMFY_OT_bake_projection(bpy.types.Operator):
         bake_node.select = True
         bm_nodes.active = bake_node
 
+        orig_engine = scene.render.engine
+        orig_cycles_samples = scene.cycles.samples
         original_mat = obj.data.materials[0]
         obj.data.materials[0] = bake_mat
 
         try:
+            scene.render.engine = 'CYCLES'
+            scene.cycles.samples = 1  # EMIT needs only 1 sample; speeds up bake significantly
             scene.render.bake.margin = 16
             bpy.ops.object.bake(type='EMIT')
 
@@ -453,15 +471,16 @@ class COMFY_OT_bake_projection(bpy.types.Operator):
 
         except Exception as e:
             self.report({'ERROR'}, f"Bake failed: {e}")
-            obj.data.materials[0] = original_mat
-            bpy.data.materials.remove(bake_mat)
-            obj.modifiers.remove(uv_mod)
-            scene.render.engine = orig_engine
             return {'CANCELLED'}
 
         finally:
-            obj.modifiers.remove(uv_mod)
+            obj.data.materials[0] = original_mat
+            bpy.data.materials.remove(bake_mat)
+            if proj_uv_name in mesh.uv_layers:
+                mesh.uv_layers.remove(mesh.uv_layers[proj_uv_name])
+            mesh.uv_layers.active = bake_uv_layer
             scene.render.engine = orig_engine
+            scene.cycles.samples = orig_cycles_samples
 
         # Replace the projection material with a clean UV-mapped material
         # using the baked image — now view-independent and ready to export.
@@ -485,9 +504,27 @@ class COMFY_OT_bake_projection(bpy.types.Operator):
         fl.new(f_bsdf.outputs['BSDF'], f_out.inputs['Surface'])
 
         obj.data.materials[0] = final_mat
-        bpy.data.materials.remove(bake_mat)
 
         self.report({'INFO'}, f"Baked to '{img_name}.png' and applied as UV material")
+        return {'FINISHED'}
+
+
+class COMFY_OT_set_control_image(bpy.types.Operator):
+    """Use the selected generated image as the control image for the next workflow run"""
+    bl_idname = "comfy.set_control_image"
+    bl_label = "Set Control Image"
+
+    def execute(self, context):
+        scene = context.scene
+        if not scene.comfy_images:
+            self.report({'ERROR'}, "No images in the list")
+            return {'CANCELLED'}
+        item = scene.comfy_images[scene.comfy_active_image]
+        scene.comfy_control_path = item.filepath
+        for inp in scene.comfy_inputs:
+            if inp.class_type == "LoadImage":
+                inp.value = item.filepath
+        self.report({'INFO'}, f"Control image set to: {item.name}")
         return {'FINISHED'}
 
 
@@ -532,6 +569,7 @@ classes = [
     COMFY_OT_apply_texture,
     COMFY_OT_project_texture,
     COMFY_OT_bake_projection,
+    COMFY_OT_set_control_image,
 ]
 
 
