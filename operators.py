@@ -349,8 +349,6 @@ class COMFY_OT_bake_projection(bpy.types.Operator):
 
     def execute(self, context):
         import os
-        from bpy_extras.object_utils import world_to_camera_view
-
         scene = context.scene
         obj = context.active_object
 
@@ -388,41 +386,29 @@ class COMFY_OT_bake_projection(bpy.types.Operator):
             bpy.ops.uv.smart_project(angle_limit=66.0, island_margin=0.02)
             bpy.ops.object.mode_set(mode='OBJECT')
 
-        # The original active UV layer is the bake OUTPUT target (one texel = one UV coord).
-        bake_uv_layer = mesh.uv_layers.active
+        uv_layer_name = mesh.uv_layers.active.name
 
-        # Compute per-loop camera-projected UVs via world_to_camera_view.
-        # window_to_camera_view is unreliable during baking (Blender shoots rays
-        # from the mesh surface, not from the camera), so we write the projected
-        # coordinates directly into a temporary UV layer and reference it explicitly
-        # in the bake material. This matches the projection material's Window coords.
-        proj_uv_name = "_comfy_proj_uv_temp"
-        if proj_uv_name in mesh.uv_layers:
-            mesh.uv_layers.remove(mesh.uv_layers[proj_uv_name])
-        proj_uv = mesh.uv_layers.new(name=proj_uv_name)
+        # UV Project modifier drives the active UV layer from camera space during baking.
+        # Must be a modifier (not computed from base vertices) so it runs on the evaluated
+        # mesh — important for subdivided meshes where base and rendered positions differ.
+        uv_mod = obj.modifiers.new("_comfy_uvproj_temp", 'UV_PROJECT')
+        uv_mod.uv_layer = uv_layer_name
+        uv_mod.projectors[0].object = scene.camera
+        rx, ry = scene.render.resolution_x, scene.render.resolution_y
+        if rx >= ry:
+            uv_mod.aspect_x = rx / ry
+            uv_mod.aspect_y = 1.0
+        else:
+            uv_mod.aspect_x = 1.0
+            uv_mod.aspect_y = ry / rx
 
-        cam = scene.camera
-        for poly in mesh.polygons:
-            for loop_idx in poly.loop_indices:
-                vi = mesh.loops[loop_idx].vertex_index
-                world_co = obj.matrix_world @ mesh.vertices[vi].co
-                cam_coord = world_to_camera_view(scene, cam, world_co)
-                proj_uv.data[loop_idx].uv = (cam_coord.x, cam_coord.y)
-
-        # Restore original UV layer as active so the bake writes into it.
-        mesh.uv_layers.active = bake_uv_layer
-
-        # Temporary emission material: proj_uv coords → source image → Emission.
-        # Emission + Emit bake captures raw colour with zero lighting influence.
+        # Temporary emission material: UV-sampled source image → Emission.
+        # No UV Map node needed — the modifier drives the active UV layer directly.
         bake_mat = bpy.data.materials.new("_comfy_bake_temp")
         bake_mat.use_nodes = True
         bm_nodes = bake_mat.node_tree.nodes
         bm_links = bake_mat.node_tree.links
         bm_nodes.clear()
-
-        bm_uv = bm_nodes.new('ShaderNodeUVMap')
-        bm_uv.uv_map = proj_uv_name
-        bm_uv.location = (-500, 100)
 
         bm_tex = bm_nodes.new('ShaderNodeTexImage')
         bm_tex.image = source_img
@@ -434,7 +420,6 @@ class COMFY_OT_bake_projection(bpy.types.Operator):
         bm_out = bm_nodes.new('ShaderNodeOutputMaterial')
         bm_out.location = (300, 100)
 
-        bm_links.new(bm_uv.outputs['UV'], bm_tex.inputs['Vector'])
         bm_links.new(bm_tex.outputs['Color'], bm_emit.inputs['Color'])
         bm_links.new(bm_emit.outputs['Emission'], bm_out.inputs['Surface'])
 
@@ -477,9 +462,7 @@ class COMFY_OT_bake_projection(bpy.types.Operator):
         finally:
             obj.data.materials[0] = original_mat
             bpy.data.materials.remove(bake_mat)
-            if proj_uv_name in mesh.uv_layers:
-                mesh.uv_layers.remove(mesh.uv_layers[proj_uv_name])
-            mesh.uv_layers.active = bake_uv_layer
+            obj.modifiers.remove(uv_mod)
             scene.render.engine = orig_engine
             scene.cycles.samples = orig_cycles_samples
 
