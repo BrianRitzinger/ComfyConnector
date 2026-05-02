@@ -379,20 +379,23 @@ class COMFY_OT_bake_projection(bpy.types.Operator):
 
         mesh = obj.data
 
-        # Auto-create UV map if the mesh has none
+        # If the mesh has no UV map at all, create one now for use as the bake target.
         if not mesh.uv_layers:
             bpy.ops.object.mode_set(mode='EDIT')
             bpy.ops.mesh.select_all(action='SELECT')
             bpy.ops.uv.smart_project(angle_limit=66.0, island_margin=0.02)
             bpy.ops.object.mode_set(mode='OBJECT')
 
-        uv_layer_name = mesh.uv_layers.active.name
+        # Use the existing active UV layer as the bake target — never overwrite it.
+        bake_uv_name = mesh.uv_layers.active.name
 
-        # UV Project modifier drives the active UV layer from camera space during baking.
-        # Must be a modifier (not computed from base vertices) so it runs on the evaluated
-        # mesh — important for subdivided meshes where base and rendered positions differ.
+        # The UV Project modifier needs its own temporary layer so it doesn't
+        # corrupt the model's real UV layout.
+        proj_layer_name = "_comfy_proj_temp"
+        proj_layer = mesh.uv_layers.get(proj_layer_name) or mesh.uv_layers.new(name=proj_layer_name)
+
         uv_mod = obj.modifiers.new("_comfy_uvproj_temp", 'UV_PROJECT')
-        uv_mod.uv_layer = uv_layer_name
+        uv_mod.uv_layer = proj_layer_name
         uv_mod.projectors[0].object = scene.camera
         rx, ry = scene.render.resolution_x, scene.render.resolution_y
         if rx >= ry:
@@ -402,17 +405,20 @@ class COMFY_OT_bake_projection(bpy.types.Operator):
             uv_mod.aspect_x = 1.0
             uv_mod.aspect_y = ry / rx
 
-        # Temporary emission material: UV-sampled source image → Emission.
-        # No UV Map node needed — the modifier drives the active UV layer directly.
         bake_mat = bpy.data.materials.new("_comfy_bake_temp")
         bake_mat.use_nodes = True
         bm_nodes = bake_mat.node_tree.nodes
         bm_links = bake_mat.node_tree.links
         bm_nodes.clear()
 
+        bm_uv = bm_nodes.new('ShaderNodeUVMap')
+        bm_uv.uv_map = proj_layer_name
+        bm_uv.location = (-500, 100)
+
         bm_tex = bm_nodes.new('ShaderNodeTexImage')
         bm_tex.image = source_img
         bm_tex.location = (-300, 100)
+        bm_links.new(bm_uv.outputs['UV'], bm_tex.inputs['Vector'])
 
         bm_emit = bm_nodes.new('ShaderNodeEmission')
         bm_emit.location = (0, 100)
@@ -443,6 +449,7 @@ class COMFY_OT_bake_projection(bpy.types.Operator):
         orig_cycles_samples = scene.cycles.samples
         original_mat = obj.data.materials[0]
         obj.data.materials[0] = bake_mat
+        mesh.uv_layers.active = mesh.uv_layers[bake_uv_name]
 
         try:
             scene.render.engine = 'CYCLES'
@@ -463,6 +470,7 @@ class COMFY_OT_bake_projection(bpy.types.Operator):
             obj.data.materials[0] = original_mat
             bpy.data.materials.remove(bake_mat)
             obj.modifiers.remove(uv_mod)
+            mesh.uv_layers.remove(proj_layer)
             scene.render.engine = orig_engine
             scene.cycles.samples = orig_cycles_samples
 
@@ -474,6 +482,10 @@ class COMFY_OT_bake_projection(bpy.types.Operator):
         fl = final_mat.node_tree.links
         fn.clear()
 
+        f_uv = fn.new('ShaderNodeUVMap')
+        f_uv.uv_map = bake_uv_name
+        f_uv.location = (-600, 0)
+
         f_tex = fn.new('ShaderNodeTexImage')
         f_tex.image = bake_img
         f_tex.location = (-300, 0)
@@ -484,6 +496,7 @@ class COMFY_OT_bake_projection(bpy.types.Operator):
         f_out = fn.new('ShaderNodeOutputMaterial')
         f_out.location = (300, 0)
 
+        fl.new(f_uv.outputs['UV'], f_tex.inputs['Vector'])
         fl.new(f_tex.outputs['Color'], f_bsdf.inputs['Base Color'])
         fl.new(f_bsdf.outputs['BSDF'], f_out.inputs['Surface'])
 
@@ -592,22 +605,23 @@ class COMFY_OT_bake_multi_projection(bpy.types.Operator):
         rx, ry = scene.render.resolution_x, scene.render.resolution_y
         N = len(slots)
 
-        # --- UV layers: one per camera (for projection), one for the bake target ---
+        # If the mesh has no UV map at all, create one now as the bake target.
+        if not mesh.uv_layers:
+            bpy.ops.object.mode_set(mode='EDIT')
+            bpy.ops.mesh.select_all(action='SELECT')
+            bpy.ops.uv.smart_project(angle_limit=66.0, island_margin=0.02)
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        # Use the existing active UV layer as the bake target — never touch it.
+        bake_uv_name = mesh.uv_layers.active.name
+
+        # Temporary projection UV layers: one per camera slot.
+        # These receive the camera-projected coordinates and are removed after baking.
         proj_uv_layers = []
         for i in range(N):
             name = f"ComfyProj_{i}"
             layer = mesh.uv_layers.get(name) or mesh.uv_layers.new(name=name)
             proj_uv_layers.append(layer)
-
-        bake_uv_name = "ComfyBakeUV"
-        bake_uv = mesh.uv_layers.get(bake_uv_name)
-        if not bake_uv:
-            bake_uv = mesh.uv_layers.new(name=bake_uv_name)
-            mesh.uv_layers.active = bake_uv
-            bpy.ops.object.mode_set(mode='EDIT')
-            bpy.ops.mesh.select_all(action='SELECT')
-            bpy.ops.uv.smart_project(angle_limit=66.0, island_margin=0.02)
-            bpy.ops.object.mode_set(mode='OBJECT')
 
         # --- UV Project modifiers: one per camera, writing to ComfyProj_i ---
         uv_mods = []
@@ -750,7 +764,7 @@ class COMFY_OT_bake_multi_projection(bpy.types.Operator):
         else:
             obj.data.materials.append(bake_mat)
 
-        mesh.uv_layers.active = bake_uv
+        mesh.uv_layers.active = mesh.uv_layers[bake_uv_name]
 
         try:
             scene.render.bake.margin = 16
@@ -770,12 +784,16 @@ class COMFY_OT_bake_multi_projection(bpy.types.Operator):
             bpy.data.materials.remove(bake_mat)
             for mod in uv_mods:
                 obj.modifiers.remove(mod)
+            for layer in proj_uv_layers:
+                mesh.uv_layers.remove(layer)
             scene.render.engine = orig_engine
             return {'CANCELLED'}
 
         finally:
             for mod in uv_mods:
                 obj.modifiers.remove(mod)
+            for layer in proj_uv_layers:
+                mesh.uv_layers.remove(layer)
             scene.render.engine = orig_engine
 
         # Apply final UV-mapped material using the baked image
